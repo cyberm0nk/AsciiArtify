@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kubectl plugin: prints CSV "Resource, Namespace, Name, CPU, Memory"
+# Supports pods (namespace-scoped) and nodes (cluster-scoped).
+# Defaults: resource=pods, namespace=kube-system
+#
+# Usage:
+#   kubectl kubeplugin [-n <namespace>] [pods|nodes]
+#   kubectl kubeplugin -A pods
+#   kubectl kubeplugin -h
+#
+# Examples:
+#   kubectl kubeplugin                   # pods in kube-system
+#   kubectl kubeplugin -n kube-system    # pods in kube-system
+#   kubectl kubeplugin -A pods           # pods across all namespaces
+#   kubectl kubeplugin nodes             # nodes (namespace shown as "-")
+
+namespace="kube-system"
+all_ns=false
+resource="pods"
+show_help=false
+
+print_help() {
+  cat <<EOF
+kubectl-kubeplugin - CSV stats: "Resource, Namespace, Name, CPU, Memory"
+
+USAGE:
+  kubectl kubeplugin [-n <namespace>] [pods|nodes]
+  kubectl kubeplugin -A pods
+  kubectl kubeplugin -h
+
+OPTIONS:
+  -n <namespace>   Namespace (default: kube-system)
+  -A               All namespaces (pods only; overrides -n)
+  -h               Help
+
+RESOURCES:
+  pods   (namespace-scoped)
+  nodes  (cluster-scoped; Namespace shown as "-")
+
+EXAMPLES:
+  kubectl kubeplugin
+  kubectl kubeplugin -n kube-system
+  kubectl kubeplugin -A pods
+  kubectl kubeplugin nodes
+EOF
+}
+
+# --- Parse flags ---
+while getopts ":n:Ah" opt; do
+  case "$opt" in
+    n) namespace="$OPTARG" ;;
+    A) all_ns=true ;;
+    h) show_help=true ;;
+    \?) echo "error: unknown option: -$OPTARG" >&2; exit 2 ;;
+    :)  echo "error: option -$OPTARG requires an argument" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# trailing positional arg: resource (optional)
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    pods|nodes) resource="$1" ;;
+    *) echo "error: unknown resource '$1' (allowed: pods|nodes)"; exit 2 ;;
+  esac
+fi
+
+if $show_help; then
+  print_help; exit 0
+fi
+
+# --- prechecks ---
+command -v kubectl >/dev/null 2>&1 || { echo "error: kubectl not found in PATH" >&2; exit 127; }
+
+# Ensure metrics API is available for kubectl top
+if ! kubectl api-resources | grep -q "^pods"; then
+  echo "error: cannot reach Kubernetes API (check kubeconfig/context)" >&2
+  exit 1
+fi
+
+# Print CSV header
+echo "Resource, Namespace, Name, CPU, Memory"
+
+# --- functions ---
+pods_stats_ns() {
+  # Single namespace
+  # kubectl top pods -n <ns> --no-headers => NAME CPU(cores) MEMORY(bytes)
+  if ! out=$(kubectl top pods -n "$namespace" --no-headers 2>/dev/null); then
+    echo "error: 'kubectl top pods' failed; ensure metrics-server is installed" >&2
+    exit 1
+  fi
+  awk -v ns="$namespace" 'BEGIN{OFS=", "}{print "pod", ns, $1, $2, $3}' <<<"$out"
+}
+
+pods_stats_all() {
+  # All namespaces
+  # kubectl top pods -A --no-headers => NAMESPACE NAME CPU MEMORY
+  if ! out=$(kubectl top pods -A --no-headers 2>/dev/null); then
+    echo "error: 'kubectl top pods -A' failed; ensure metrics-server is installed" >&2
+    exit 1
+  fi
+  awk 'BEGIN{OFS=", "}{print "pod", $1, $2, $3, $4}' <<<"$out"
+}
+
+nodes_stats() {
+  # kubectl top nodes --no-headers => NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
+  if ! out=$(kubectl top nodes --no-headers 2>/dev/null); then
+    echo "error: 'kubectl top nodes' failed; ensure metrics-server is installed" >&2
+    exit 1
+  fi
+  # Namespace is "-" for nodes
+  awk 'BEGIN{OFS=", "}{print "node", "-", $1, $2, $4}' <<<"$out"
+}
+
+# --- dispatch ---
+case "$resource" in
+  pods)
+    if $all_ns; then
+      pods_stats_all
+    else
+      pods_stats_ns
+    fi
+    ;;
+  nodes)
+    nodes_stats
+    ;;
+esac
+
